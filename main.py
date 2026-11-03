@@ -97,6 +97,24 @@ SCREEN_KEYBOARDS = {
     'payment_waiting_receipt': get_payment_confirmation_keyboard,
 }
 
+# Подсказки для сообщений, которые не подходят текущему шагу диалога.
+INVALID_ACTION_MESSAGES = {
+    'main': 'Не удалось распознать команду. Выберите «Корзина» или «Оплатить Заказ» либо нажмите «Начать».',
+    'cart': 'Такого действия в корзине нет. Используйте кнопки «Добавить товар», «Изменить корзину», «Очистить корзину» или «Назад».',
+    'cart_edit': 'Не удалось распознать действие. Выберите удаление товара, изменение количества или размера либо нажмите «Назад».',
+    'cart_article': 'Сейчас нужно ввести артикул товара из каталога. Либо нажмите «Отмена».',
+    'cart_size': f'Сейчас нужно ввести размер товара (не более {MAX_SIZE_LEN} символов). Либо нажмите «Отмена».',
+    'cart_quantity': f'Сейчас нужно ввести целое количество от 1 до {MAX_QTY}. Либо нажмите «Отмена».',
+    'cart_remove': 'Сейчас нужно указать номер товара из списка корзины. Введите номер или нажмите «Отмена».',
+    'cart_change_num': 'Сейчас нужно указать номер товара, количество которого хотите изменить. Введите номер из списка или нажмите «Отмена».',
+    'cart_change_qty': f'Сейчас нужно указать новое количество — целое число от 1 до {MAX_QTY}. Либо нажмите «Отмена».',
+    'cart_resize_num': 'Сейчас нужно указать номер товара, у которого есть размер. Введите номер из списка или нажмите «Отмена».',
+    'cart_resize_new': f'Сейчас нужно написать новый размер (не более {MAX_SIZE_LEN} символов). Либо нажмите «Отмена».',
+    'payment_choice': 'Выберите один из предложенных способов оплаты: «Оплатить по реквизитам» или «Оплатить через СБП». Для выхода нажмите «Назад в меню».',
+    'payment_waiting_receipt': 'Ожидаю подтверждение оплаты. Нажмите «Я оплатил(а)», если уже оплатили, или «Отмена», чтобы вернуться в меню.',
+    'market_confirm': 'Чтобы продолжить, нажмите «В корзину» под карточкой товара или «Отмена».',
+}
+
 
 def cart_has_sized_items(user_id):
     """True, если в корзине есть хотя бы один товар с размером."""
@@ -111,7 +129,25 @@ def cart_edit_keyboard(user_id):
 def keyboard_for_screen(user_id, screen):
     if screen == 'cart_edit':
         return cart_edit_keyboard(user_id)
+    if screen in ('cart_article', 'cart_size', 'cart_quantity', 'cart_remove',
+                  'cart_change_num', 'cart_change_qty', 'cart_resize_num', 'cart_resize_new'):
+        return get_item_input_keyboard()
+    if screen == 'market_confirm':
+        pending = pending_market.get(user_id)
+        if pending:
+            return get_market_confirm_keyboard(pending['article'])
     return SCREEN_KEYBOARDS.get(screen, get_main_keyboard)()
+
+
+def send_invalid_action(sender, screen, attachments=None):
+    # Объясняем ожидаемое действие и оставляем пользователя на текущем шаге.
+    message = INVALID_ACTION_MESSAGES.get(
+        screen,
+        'Не удалось распознать действие. Нажмите «Начать», чтобы открыть главное меню.'
+    )
+    if attachments:
+        message += '\n\nПохоже, вы отправили вложение. На этом шаге нужно выполнить действие, указанное выше.'
+    write_massage(sender, message, keyboard_for_screen(sender, screen))
 
 
 def go_main_menu(sender, text='Главное меню:'):
@@ -563,7 +599,7 @@ def export_orders_to_excel(path=ORDERS_XLSX):
 # ------------------------------------------------------------------ команды админа
 
 def handle_admin_command(sender, text):
-    if text == '/export':
+    if text.lower() == '/export':
         count = export_orders_to_excel()
         if count is None:
             write_massage(sender, 'Не удалось сохранить orders.xlsx — закройте файл в Excel и повторите.')
@@ -588,14 +624,18 @@ def handle_admin_command(sender, text):
                                   'или запятую, например: /delivered 5 6 7')
         else:
             order_ids = list(dict.fromkeys(int(n) for n in re.findall(r'\d+', rest)))
-            results = [mark_delivered(order_id) for order_id in order_ids]
-            write_massage(sender, '\n'.join(results))
+            if not order_ids or any(order_id < 1 for order_id in order_ids):
+                write_massage(sender, 'Номер заказа должен быть положительным целым числом. Пример: /delivered 5')
+            else:
+                results = [mark_delivered(order_id) for order_id in order_ids]
+                write_massage(sender, '\n'.join(results))
         return
 
-    write_massage(sender, 'Команды админа:\n'
-                          '/export — выгрузить заказы в orders.xlsx\n'
+    write_massage(sender, 'Команда не распознана или введена неправильно.\n\n'
+                          'Доступные команды администратора:\n'
+                          '/export — выгрузить заказы в orders.xlsx (без дополнительных параметров)\n'
                           '/delivered N — отметить заказ №N доставленным и уведомить покупателя\n'
-                          '/delivered N M K — то же для нескольких заказов сразу (через пробел или запятую)')
+                          '/delivered N M K — отметить несколько заказов (номера через пробел или запятую).')
 
 
 # ------------------------------------------------------------------ обработка сообщений
@@ -647,6 +687,16 @@ def process_message(message):
     payload = message.get('payload')
     screen = user_screen.get(sender, 'main')
 
+    # Проверяем целостность временных данных после перезапуска/сбоя состояния.
+    if screen in ('cart_size', 'cart_quantity', 'cart_change_qty', 'cart_resize_new'):
+        if not temp_item.get(sender):
+            reset_state(sender)
+            write_massage(sender,
+                          'Не удалось восстановить шаг добавления или изменения товара. '
+                          'Действие отменено, корзина не изменена. Начните заново.',
+                          get_main_keyboard())
+            return
+
     # --- Команды админа ---
     if sender == ADMIN_ID and text.startswith('/'):
         handle_admin_command(sender, text)
@@ -667,7 +717,10 @@ def process_message(message):
         article = parse_payload(payload).get('article')
         if article:
             handle_add_market_to_cart(sender, str(article))
-            return
+        else:
+            write_massage(sender, 'Не удалось определить товар по кнопке. Откройте карточку товара в VK Market и отправьте её боту ещё раз.',
+                          get_main_keyboard())
+        return
 
     # --- Команды меню (работают с любого экрана) ---
     if text == 'Начать':
@@ -736,6 +789,10 @@ def process_message(message):
 
     # --- Меню редактирования корзины ---
     if screen == 'cart_edit':
+        if not get_cart(sender):
+            user_screen[sender] = 'cart'
+            write_massage(sender, 'Корзина уже пуста. Сначала добавьте товар.', get_cart_keyboard())
+            return
         if text == 'Удалить товар':
             user_screen[sender] = 'cart_remove'
             write_massage(sender, 'Введите номер товара для удаления:', get_item_input_keyboard())
@@ -764,13 +821,14 @@ def process_message(message):
             return
         pos = parse_position(text)
         if pos is None:
-            write_massage(sender, 'Введите число.', get_item_input_keyboard())
+            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', get_item_input_keyboard())
             return
         if remove_cart_item(sender, pos):
-            write_massage(sender, 'Товар удалён.')
+            write_massage(sender, '✅ Товар удалён.')
+            show_cart(sender)
         else:
-            write_massage(sender, 'Такого номера нет.')
-        show_cart(sender)
+            write_massage(sender, 'Такого номера нет в корзине. Проверьте список и введите существующий номер или нажмите «Отмена».',
+                          get_item_input_keyboard())
         return
 
     # --- Выбор номера для изменения количества ---
@@ -780,7 +838,7 @@ def process_message(message):
             return
         pos = parse_position(text)
         if pos is None:
-            write_massage(sender, 'Введите число.', get_item_input_keyboard())
+            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', get_item_input_keyboard())
             return
         if not 1 <= pos <= len(get_cart(sender)):
             write_massage(sender, 'Такого номера нет. Введите номер из списка.',
@@ -819,7 +877,7 @@ def process_message(message):
         pos = parse_position(text)
         cart = get_cart(sender)
         if pos is None:
-            write_massage(sender, 'Введите число.', get_item_input_keyboard())
+            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', get_item_input_keyboard())
             return
         if not 1 <= pos <= len(cart):
             write_massage(sender, 'Такого номера нет. Введите номер из списка.',
@@ -899,10 +957,8 @@ def process_message(message):
         write_massage(sender, 'Отменено. Главное меню:', get_main_keyboard())
         return
 
-    # --- Непонятное сообщение ---
-    keyboard = keyboard_for_screen(sender, screen)
-    write_massage(sender, 'Не понял вас. Воспользуйтесь кнопками ниже или нажмите «Начать».',
-                  keyboard)
+    # --- Любое другое действие, не предусмотренное текущим экраном ---
+    send_invalid_action(sender, screen, attachments)
 
 
 # ------------------------------------------------------------------ запуск
