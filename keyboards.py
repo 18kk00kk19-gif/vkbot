@@ -15,10 +15,8 @@ def get_main_keyboard():
 def get_cart_keyboard():
     """Меню корзины."""
     keyboard = VkKeyboard(one_time=False)
-    keyboard.add_button('Очистить корзину', color=VkKeyboardColor.NEGATIVE)
-    keyboard.add_button('Добавить товар', color=VkKeyboardColor.POSITIVE)
-    keyboard.add_line()
     keyboard.add_button('Изменить корзину', color=VkKeyboardColor.PRIMARY)
+    keyboard.add_button('Очистить корзину', color=VkKeyboardColor.NEGATIVE)
     keyboard.add_line()
     keyboard.add_button('Назад', color=VkKeyboardColor.PRIMARY)
     return keyboard

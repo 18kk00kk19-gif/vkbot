@@ -92,6 +92,11 @@ user_screen = {}      # user_id -> название экрана
 temp_item = {}        # user_id -> данные товара, который сейчас вводится
 pending_market = {}   # user_id -> товар из VK Market, ожидающий «В корзину»
 
+ADD_ITEM_HELP = (
+    'Товары добавляются в корзину через каталог: откройте «Каталог», выберите товар, '
+    'нажмите «Написать» и отправьте карточку товара боту.'
+)
+
 # Клавиатура для ответа «не понял», чтобы пользователь видел кнопки своего экрана
 SCREEN_KEYBOARDS = {
     'cart': get_cart_keyboard,
@@ -102,9 +107,8 @@ SCREEN_KEYBOARDS = {
 # Подсказки для сообщений, которые не подходят текущему шагу диалога.
 INVALID_ACTION_MESSAGES = {
     'main': 'Не удалось распознать команду. Выберите «Корзина» или «Оплатить Заказ» либо нажмите «Начать».',
-    'cart': 'Такого действия в корзине нет. Используйте кнопки «Добавить товар», «Изменить корзину», «Очистить корзину» или «Назад».',
+    'cart': 'Такого действия в корзине нет. Используйте кнопки «Изменить корзину», «Очистить корзину» или «Назад».',
     'cart_edit': 'Не удалось распознать действие. Выберите удаление товара, изменение количества или размера либо нажмите «Назад».',
-    'cart_article': 'Сейчас нужно ввести артикул товара из каталога. Либо нажмите «Отмена».',
     'cart_size': f'Сейчас нужно ввести размер товара (не более {MAX_SIZE_LEN} символов). Либо нажмите «Отмена».',
     'cart_quantity': f'Сейчас нужно ввести целое количество от 1 до {MAX_QTY}. Либо нажмите «Отмена».',
     'cart_remove': 'Сейчас нужно указать номер товара из списка корзины. Введите номер или нажмите «Отмена».',
@@ -134,7 +138,7 @@ def keyboard_for_screen(user_id, screen):
     if screen in ('cart_size', 'cart_resize_new'):
         sizes = (temp_item.get(user_id) or {}).get('sizes')
         return get_size_keyboard(sizes) if sizes else get_item_input_keyboard()
-    if screen in ('cart_article', 'cart_quantity', 'cart_remove',
+    if screen in ('cart_quantity', 'cart_remove',
                   'cart_change_num', 'cart_change_qty', 'cart_resize_num'):
         return get_item_input_keyboard()
     if screen == 'market_confirm':
@@ -343,8 +347,7 @@ def show_cart(sender):
     user_screen[sender] = 'cart'
     text, _ = format_cart_text(sender)
     if text is None:
-        write_massage(sender, 'Корзина пуста. Нажмите «Добавить товар», чтобы начать.',
-                      get_cart_keyboard())
+        write_massage(sender, 'Корзина пуста. ' + ADD_ITEM_HELP, get_cart_keyboard())
         return
     write_massage(sender, text, get_cart_keyboard())
 
@@ -466,8 +469,8 @@ def handle_add_market_to_cart(sender, article):
     product = get_product(article)
 
     if not product:
-        write_massage(sender, 'Товар не найден. Пришлите его ещё раз или введите артикул '
-                              'через «Корзина» → «Добавить товар».', get_main_keyboard())
+        write_massage(sender, 'Товар не найден. Пришлите карточку товара из каталога ещё раз.',
+                      get_main_keyboard())
         reset_state(sender)
         return
 
@@ -837,6 +840,11 @@ def process_message(message):
                           get_main_keyboard())
             return
 
+    # Ввода по артикулу больше нет: если состояние осталось от старой версии — возвращаем в меню.
+    if screen == 'cart_article':
+        go_main_menu(sender, 'Добавление по артикулу отключено. ' + ADD_ITEM_HELP)
+        return
+
     # --- Команды админа ---
     if sender == ADMIN_ID and text.startswith('/'):
         handle_admin_command(sender, text)
@@ -879,9 +887,8 @@ def process_message(message):
 
     # --- Меню корзины ---
     if screen == 'cart':
-        if text == 'Добавить товар':
-            user_screen[sender] = 'cart_article'
-            write_massage(sender, 'Введите артикул товара:', get_item_input_keyboard())
+        if text == 'Добавить товар':   # кнопка из старой клавиатуры
+            write_massage(sender, ADD_ITEM_HELP, get_cart_keyboard())
             return
         if text == 'Изменить корзину':
             show_cart_edit(sender)
@@ -1067,23 +1074,12 @@ def process_message(message):
         return
 
     # --- Отмена при вводе товара ---
-    if screen in ('cart_article', 'cart_size', 'cart_quantity') and text == 'Отмена':
+    if screen in ('cart_size', 'cart_quantity') and text == 'Отмена':
         temp_item.pop(sender, None)
         show_cart(sender)
         return
 
     # --- Шаги ввода товара ---
-    if screen == 'cart_article':
-        article = text.strip()
-        product = get_product(article) if is_real_article(article) else None
-        if not product:
-            write_massage(sender, '❌ Артикул не верный: товара с таким артикулом нет в каталоге.\n'
-                                  'Проверьте артикул на странице товара и введите его ещё раз '
-                                  'или нажмите «Отмена».', get_item_input_keyboard())
-            return
-        ask_item_details(sender, article, product)
-        return
-
     if screen == 'cart_size':
         sizes = temp_item[sender].get('sizes')
         if sizes:
