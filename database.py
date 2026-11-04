@@ -94,6 +94,7 @@ def init_db():
             'ALTER TABLE orders ADD COLUMN payment_photo TEXT',
             'ALTER TABLE order_items ADD COLUMN price INTEGER',  # цена на момент заказа
             'ALTER TABLE products ADD COLUMN vk_id INTEGER',     # id товара в VK Market
+            'ALTER TABLE products ADD COLUMN sizes TEXT',        # доступные размеры (JSON-список)
         ]:
             try:
                 cursor.execute(col_sql)
@@ -179,6 +180,19 @@ def get_product_by_vk_id(vk_id):
         ).fetchone()
 
 
+def get_product_sizes(article):
+    """Список доступных размеров товара ([] — если не заданы)."""
+    with connect() as conn:
+        row = conn.execute('SELECT sizes FROM products WHERE article = ?', (article,)).fetchone()
+    if not row or not row[0]:
+        return []
+    try:
+        sizes = json.loads(row[0])
+    except json.JSONDecodeError:
+        return []
+    return [str(s) for s in sizes] if isinstance(sizes, list) else []
+
+
 def _norm_name(name):
     # casefold() работает с кириллицей, в отличие от SQLite LOWER()
     return ' '.join((name or '').split()).casefold()
@@ -187,29 +201,32 @@ def _norm_name(name):
 def upsert_market_items(records):
     """Синхронизирует товары из VK Market с таблицей products.
 
-    records: [{'vk_id': int, 'article': str, 'name': str, 'price': int}, ...]
+    records: [{'vk_id': int, 'article': str, 'name': str, 'price': int, 'sizes': [str, ...]}, ...]
 
     Для каждого товара ищем строку в таблице: по vk_id -> по артикулу -> по названию
     (так старые товары, загруженные из Excel, не дублируются, а «привязываются» к VK).
     Найденному обновляем название и цену; has_size и артикул не трогаем.
-    Новый товар добавляется с has_size = 1.
+    Размеры (sizes) обновляются; если они есть, товару ставится has_size = 1.
+    Новый товар получает has_size = 1, если у него есть размеры, иначе 0.
     Возвращает (добавлено, изменено).
     """
     added = changed = 0
     with connect() as conn:
         cur = conn.cursor()
-        rows = cur.execute('SELECT id, article, name, price, vk_id FROM products').fetchall()
+        rows = cur.execute('SELECT id, article, name, price, vk_id, sizes FROM products').fetchall()
         by_vk = {r[4]: r[0] for r in rows if r[4] is not None}
         by_article = {r[1]: r[0] for r in rows}
         vk_of = {r[0]: r[4] for r in rows}
-        data = {r[0]: (r[2], r[3]) for r in rows}
+        data = {r[0]: (r[2], r[3], r[5]) for r in rows}
         by_name = {}
-        for pid, _, name, _, vk in rows:
+        for pid, _, name, _, vk, _ in rows:
             if vk is None:
                 by_name.setdefault(_norm_name(name), pid)
 
         for rec in records:
             vk_id, article, name, price = rec['vk_id'], rec['article'], rec['name'], rec['price']
+            sizes = rec.get('sizes') or []
+            sizes_json = json.dumps(sizes, ensure_ascii=False) if sizes else None
 
             pid = by_vk.get(vk_id)
             if pid is None:
@@ -222,21 +239,24 @@ def upsert_market_items(records):
                     pid = None  # эта строка уже привязана к другому товару VK
 
             if pid is not None:
-                if data[pid] != (name, price) or vk_of.get(pid) != vk_id:
-                    cur.execute('UPDATE products SET vk_id = ?, name = ?, price = ? WHERE id = ?',
-                                (vk_id, name, price, pid))
+                if data[pid] != (name, price, sizes_json) or vk_of.get(pid) != vk_id:
+                    cur.execute(
+                        'UPDATE products SET vk_id = ?, name = ?, price = ?, sizes = ?, '
+                        'has_size = CASE WHEN ? IS NOT NULL THEN 1 ELSE has_size END WHERE id = ?',
+                        (vk_id, name, price, sizes_json, sizes_json, pid))
                     changed += 1
-                data[pid] = (name, price)
+                data[pid] = (name, price, sizes_json)
             else:
                 if article in by_article:   # такой SKU уже занят другим товаром
                     article = f'vk{vk_id}'
                 cur.execute(
-                    'INSERT INTO products (article, name, price, has_size, vk_id) '
-                    'VALUES (?, ?, ?, 1, ?)', (article, name, price, vk_id)
+                    'INSERT INTO products (article, name, price, has_size, vk_id, sizes) '
+                    'VALUES (?, ?, ?, ?, ?, ?)',
+                    (article, name, price, 1 if sizes else 0, vk_id, sizes_json)
                 )
                 pid = cur.lastrowid
                 by_article[article] = pid
-                data[pid] = (name, price)
+                data[pid] = (name, price, sizes_json)
                 added += 1
             by_vk[vk_id] = pid
             vk_of[pid] = vk_id

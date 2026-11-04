@@ -18,13 +18,13 @@ from database import (
     STATUS_DELIVERED,
     add_to_cart, checkout_cart, clear_cart, get_cart, get_order,
     get_order_items, get_order_total, get_orders_for_export, get_product,
-    get_product_by_vk_id, init_db, load_all_states, remove_cart_item, save_state,
+    get_product_by_vk_id, get_product_sizes, init_db, load_all_states, remove_cart_item, save_state,
     set_status, update_cart_quantity, update_cart_size, upsert_market_items,
 )
 from keyboards import (
     get_cart_edit_keyboard, get_cart_keyboard, get_item_input_keyboard,
     get_main_keyboard, get_market_confirm_keyboard,
-    get_payment_confirmation_keyboard, get_payment_keyboard,
+    get_payment_confirmation_keyboard, get_payment_keyboard, get_size_keyboard,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +63,7 @@ ADMIN_ID = 588644580
 MAX_QTY = 99          # максимум штук одной позиции за раз
 MAX_SIZE_LEN = 20     # максимальная длина размера
 CATALOG_SYNC_INTERVAL = 30 * 60   # как часто обновлять каталог из VK Market (секунды)
+MARKET_DEBUG = True   # присылать админу «сырые» данные товара из VK (для отладки)
 
 ORDERS_XLSX = os.path.join(BASE_DIR, 'orders.xlsx')
 QR_PATH = os.path.join(BASE_DIR, 'qr-code.png')
@@ -130,8 +131,11 @@ def cart_edit_keyboard(user_id):
 def keyboard_for_screen(user_id, screen):
     if screen == 'cart_edit':
         return cart_edit_keyboard(user_id)
-    if screen in ('cart_article', 'cart_size', 'cart_quantity', 'cart_remove',
-                  'cart_change_num', 'cart_change_qty', 'cart_resize_num', 'cart_resize_new'):
+    if screen in ('cart_size', 'cart_resize_new'):
+        sizes = (temp_item.get(user_id) or {}).get('sizes')
+        return get_size_keyboard(sizes) if sizes else get_item_input_keyboard()
+    if screen in ('cart_article', 'cart_quantity', 'cart_remove',
+                  'cart_change_num', 'cart_change_qty', 'cart_resize_num'):
         return get_item_input_keyboard()
     if screen == 'market_confirm':
         pending = pending_market.get(user_id)
@@ -159,12 +163,38 @@ def go_main_menu(sender, text='Главное меню:'):
 
 # ------------------------------------------------------------------ каталог
 
+def parse_sizes(description):
+    """Размеры из описания товара: строка вида «Размер: 41, 43, 45» -> ['41', '43', '45']."""
+    m = re.search(r'^[ \t]*Размеры?[ \t]*:[ \t]*(.+)$', description or '', re.IGNORECASE | re.MULTILINE)
+    if not m:
+        return []
+    sizes = []
+    for part in re.split(r'[,;]', m.group(1)):
+        part = part.strip()
+        if part and len(part) <= MAX_SIZE_LEN and part not in sizes:
+            sizes.append(part)
+    return sizes
+
+
+def match_size(sizes, text):
+    """Возвращает размер из списка, совпадающий с текстом (без учёта регистра), либо None."""
+    for size in sizes:
+        if size.casefold() == text.casefold():
+            return size
+    return None
+
+
 def market_item_record(item):
     """Товар из VK Market (market.get / market.getById) -> запись для таблицы products.
     Артикул = SKU из VK; если SKU не заполнен, используем id товара в VK."""
     sku = str(item.get('sku') or '').strip()
     if sku.lower() == 'none':
         sku = ''
+    if not sku:
+        # запасной вариант: «Артикул: 546» в тексте описания
+        found = re.search(r'Артикул[ \t]*[:№-]?[ \t]*([\w./-]+)', str(item.get('description') or ''),
+                          re.IGNORECASE)
+        sku = found.group(1) if found else ''
     price_data = item.get('price') or {}
     try:
         price = int(price_data.get('amount', 0)) // 100   # VK отдаёт цену в копейках
@@ -175,6 +205,7 @@ def market_item_record(item):
         'article': sku or str(item['id']),
         'name': str(item.get('title') or 'Товар').strip(),
         'price': price,
+        'sizes': parse_sizes(item.get('description')),
     }
 
 
@@ -347,8 +378,13 @@ def ask_item_details(sender, article, product):
     name, _, has_size = product
     temp_item[sender] = {'article': article}
     if has_size:
+        sizes = get_product_sizes(article)
         user_screen[sender] = 'cart_size'
-        write_massage(sender, f'Товар: {name}. Введите размер:', get_item_input_keyboard())
+        if sizes:
+            temp_item[sender]['sizes'] = sizes
+            write_massage(sender, f'Товар: {name}. Выберите размер:', get_size_keyboard(sizes))
+        else:
+            write_massage(sender, f'Товар: {name}. Введите размер:', get_item_input_keyboard())
     else:
         temp_item[sender]['size'] = '-'
         user_screen[sender] = 'cart_quantity'
@@ -378,7 +414,9 @@ def extract_market_item(attachments):
                 'extended': 1,
             })
             if response.get('items'):
-                return response['items'][0]
+                item = response['items'][0]
+                item['_raw_attachment'] = market_data   # только для отладки
+                return item
         except Exception as e:
             print(f'Ошибка market.getById: {e}')
     return None
@@ -391,6 +429,14 @@ def handle_market_item(sender, market_item):
     # Товар мог появиться в VK после последней синхронизации — добавляем/обновляем сразу.
     upsert_market_items([record])
     article, title, price, _ = get_product_by_vk_id(record['vk_id'])
+    sizes = get_product_sizes(article)
+
+    if MARKET_DEBUG:
+        raw = json.dumps(market_item, ensure_ascii=False, default=str)
+        print('MARKET ITEM RAW:', raw)
+        if sender == ADMIN_ID:
+            for i in range(0, len(raw), 3500):
+                write_massage(sender, 'DEBUG market item:\n' + raw[i:i + 3500])
 
     pending_market[sender] = {'article': article, 'title': title, 'price': price}
     user_screen[sender] = 'market_confirm'
@@ -400,8 +446,9 @@ def handle_market_item(sender, market_item):
         f'Вы прислали товар:\n'
         f'📦 {title}\n'
         f'💰 Цена: {price} ₽\n'
-        f'🆔 Артикул: {article}\n\n'
-        f'Добавить его в корзину?',
+        f'🆔 Артикул: {article}\n'
+        + (f'📏 Размеры: {", ".join(sizes)}\n' if sizes else '')
+        + '\nДобавить его в корзину?',
         get_market_confirm_keyboard(article)
     )
 
@@ -910,10 +957,16 @@ def process_message(message):
             write_massage(sender, 'У этого товара нет размера. Введите номер другого товара.',
                           get_item_input_keyboard())
             return
+        sizes = get_product_sizes(cart[pos - 1][0])
         temp_item[sender] = {'position': pos}
         user_screen[sender] = 'cart_resize_new'
-        write_massage(sender, f'Текущий размер: {cart[pos - 1][1]}. Введите новый размер:',
-                      get_item_input_keyboard())
+        if sizes:
+            temp_item[sender]['sizes'] = sizes
+            write_massage(sender, f'Текущий размер: {cart[pos - 1][1]}. Выберите новый размер:',
+                          get_size_keyboard(sizes))
+        else:
+            write_massage(sender, f'Текущий размер: {cart[pos - 1][1]}. Введите новый размер:',
+                          get_item_input_keyboard())
         return
 
     # --- Ввод нового размера ---
@@ -922,6 +975,14 @@ def process_message(message):
             temp_item.pop(sender, None)
             show_cart(sender)
             return
+        sizes = temp_item[sender].get('sizes')
+        if sizes:
+            chosen = match_size(sizes, text)
+            if not chosen:
+                write_massage(sender, 'Выберите размер кнопкой из списка или нажмите «Отмена».',
+                              get_size_keyboard(sizes))
+                return
+            text = chosen
         if not text or len(text) > MAX_SIZE_LEN:
             write_massage(sender, f'Введите размер текстом (до {MAX_SIZE_LEN} символов).',
                           get_item_input_keyboard())
@@ -952,11 +1013,20 @@ def process_message(message):
         return
 
     if screen == 'cart_size':
+        sizes = temp_item[sender].get('sizes')
+        if sizes:
+            chosen = match_size(sizes, text)
+            if not chosen:
+                write_massage(sender, 'Выберите размер кнопкой из списка или нажмите «Отмена».',
+                              get_size_keyboard(sizes))
+                return
+            text = chosen
         if not text or len(text) > MAX_SIZE_LEN:
             write_massage(sender, f'Введите размер текстом (до {MAX_SIZE_LEN} символов).',
                           get_item_input_keyboard())
             return
         temp_item[sender]['size'] = text
+        temp_item[sender].pop('sizes', None)
         user_screen[sender] = 'cart_quantity'
         write_massage(sender, f'Введите количество (от 1 до {MAX_QTY}):',
                       get_item_input_keyboard())

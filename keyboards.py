@@ -70,3 +70,14 @@ def get_market_confirm_keyboard(article):
     keyboard.add_button('В корзину', color=VkKeyboardColor.POSITIVE, payload={'article': article})
     keyboard.add_button('Отмена', color=VkKeyboardColor.NEGATIVE)
     return keyboard
+
+def get_size_keyboard(sizes):
+    """Кнопки с размерами товара (по 4 в ряд) и «Отмена». У VK лимит — 10 рядов, поэтому до 36 размеров."""
+    keyboard = VkKeyboard(one_time=False)
+    for i, size in enumerate(sizes[:36]):
+        if i and i % 4 == 0:
+            keyboard.add_line()
+        keyboard.add_button(size[:40], color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button('Отмена', color=VkKeyboardColor.NEGATIVE)
+    return keyboard
