@@ -79,3 +79,16 @@ def get_size_keyboard(sizes):
     keyboard.add_line()
     keyboard.add_button('Отмена', color=VkKeyboardColor.NEGATIVE)
     return keyboard
+
+
+def get_number_keyboard(numbers):
+    """Кнопки с номерами позиций корзины (по 4 в ряд) и «Отмена». У VK лимит — 10 рядов, поэтому до 36 кнопок;
+    если позиций больше, номер можно ввести текстом."""
+    keyboard = VkKeyboard(one_time=False)
+    for i, number in enumerate(numbers[:36]):
+        if i and i % 4 == 0:
+            keyboard.add_line()
+        keyboard.add_button(str(number), color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button('Отмена', color=VkKeyboardColor.NEGATIVE)
+    return keyboard

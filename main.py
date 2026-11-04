@@ -24,7 +24,8 @@ from database import (
 from keyboards import (
     get_cart_edit_keyboard, get_cart_keyboard, get_item_input_keyboard,
     get_main_keyboard, get_market_confirm_keyboard,
-    get_payment_confirmation_keyboard, get_payment_keyboard, get_size_keyboard,
+    get_number_keyboard, get_payment_confirmation_keyboard, get_payment_keyboard,
+    get_size_keyboard,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -111,10 +112,10 @@ INVALID_ACTION_MESSAGES = {
     'cart_edit': 'Не удалось распознать действие. Выберите удаление товара, изменение количества или размера либо нажмите «Назад».',
     'cart_size': f'Сейчас нужно ввести размер товара (не более {MAX_SIZE_LEN} символов). Либо нажмите «Отмена».',
     'cart_quantity': f'Сейчас нужно ввести целое количество от 1 до {MAX_QTY}. Либо нажмите «Отмена».',
-    'cart_remove': 'Сейчас нужно указать номер товара из списка корзины. Введите номер или нажмите «Отмена».',
-    'cart_change_num': 'Сейчас нужно указать номер товара, количество которого хотите изменить. Введите номер из списка или нажмите «Отмена».',
+    'cart_remove': 'Сейчас нужно выбрать номер товара из списка корзины. Нажмите кнопку с номером или «Отмена».',
+    'cart_change_num': 'Сейчас нужно выбрать номер товара, количество которого хотите изменить. Нажмите кнопку с номером или «Отмена».',
     'cart_change_qty': f'Сейчас нужно указать новое количество — целое число от 1 до {MAX_QTY}. Либо нажмите «Отмена».',
-    'cart_resize_num': 'Сейчас нужно указать номер товара, у которого есть размер. Введите номер из списка или нажмите «Отмена».',
+    'cart_resize_num': 'Сейчас нужно выбрать номер товара, у которого есть размер. Нажмите кнопку с номером или «Отмена».',
     'cart_resize_new': f'Сейчас нужно написать новый размер (не более {MAX_SIZE_LEN} символов). Либо нажмите «Отмена».',
     'payment_choice': 'Выберите один из предложенных способов оплаты: «Оплатить по реквизитам» или «Оплатить через СБП». Для выхода нажмите «Назад в меню».',
     'payment_waiting_receipt': 'Ожидаю подтверждение оплаты. Нажмите «Я оплатил(а)», если уже оплатили, или «Отмена», чтобы вернуться в меню.',
@@ -132,14 +133,24 @@ def cart_edit_keyboard(user_id):
     return get_cart_edit_keyboard(show_change_size=cart_has_sized_items(user_id))
 
 
+def cart_position_numbers(user_id, screen):
+    """Номера позиций корзины для кнопок. Для смены размера — только позиции, у которых есть размер."""
+    cart = get_cart(user_id)
+    if screen == 'cart_resize_num':
+        return [i for i, (_, size, _) in enumerate(cart, start=1) if size and size != '-']
+    return list(range(1, len(cart) + 1))
+
+
 def keyboard_for_screen(user_id, screen):
     if screen == 'cart_edit':
         return cart_edit_keyboard(user_id)
+    if screen in ('cart_remove', 'cart_change_num', 'cart_resize_num'):
+        numbers = cart_position_numbers(user_id, screen)
+        return get_number_keyboard(numbers) if numbers else get_item_input_keyboard()
     if screen in ('cart_size', 'cart_resize_new'):
         sizes = (temp_item.get(user_id) or {}).get('sizes')
         return get_size_keyboard(sizes) if sizes else get_item_input_keyboard()
-    if screen in ('cart_quantity', 'cart_remove',
-                  'cart_change_num', 'cart_change_qty', 'cart_resize_num'):
+    if screen in ('cart_quantity', 'cart_change_qty'):
         return get_item_input_keyboard()
     if screen == 'market_confirm':
         pending = pending_market.get(user_id)
@@ -942,11 +953,13 @@ def process_message(message):
             return
         if text == 'Удалить товар':
             user_screen[sender] = 'cart_remove'
-            write_massage(sender, 'Введите номер товара для удаления:', get_item_input_keyboard())
+            write_massage(sender, 'Выберите номер товара для удаления:',
+                          keyboard_for_screen(sender, 'cart_remove'))
             return
         if text == 'Изменить количество':
             user_screen[sender] = 'cart_change_num'
-            write_massage(sender, 'Введите номер товара:', get_item_input_keyboard())
+            write_massage(sender, 'Выберите номер товара:',
+                          keyboard_for_screen(sender, 'cart_change_num'))
             return
         if text == 'Изменить размер':
             if not cart_has_sized_items(sender):
@@ -954,8 +967,8 @@ def process_message(message):
                               cart_edit_keyboard(sender))
                 return
             user_screen[sender] = 'cart_resize_num'
-            write_massage(sender, 'Введите номер товара, у которого нужно изменить размер:',
-                          get_item_input_keyboard())
+            write_massage(sender, 'Выберите номер товара, у которого нужно изменить размер:',
+                          keyboard_for_screen(sender, 'cart_resize_num'))
             return
         if text == 'Назад':
             show_cart(sender)
@@ -968,14 +981,14 @@ def process_message(message):
             return
         pos = parse_position(text)
         if pos is None:
-            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', get_item_input_keyboard())
+            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', keyboard_for_screen(sender, 'cart_remove'))
             return
         if remove_cart_item(sender, pos):
             write_massage(sender, '✅ Товар удалён.')
             show_cart(sender)
         else:
             write_massage(sender, 'Такого номера нет в корзине. Проверьте список и введите существующий номер или нажмите «Отмена».',
-                          get_item_input_keyboard())
+                          keyboard_for_screen(sender, 'cart_remove'))
         return
 
     # --- Выбор номера для изменения количества ---
@@ -985,11 +998,11 @@ def process_message(message):
             return
         pos = parse_position(text)
         if pos is None:
-            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', get_item_input_keyboard())
+            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', keyboard_for_screen(sender, 'cart_change_num'))
             return
         if not 1 <= pos <= len(get_cart(sender)):
             write_massage(sender, 'Такого номера нет. Введите номер из списка.',
-                          get_item_input_keyboard())
+                          keyboard_for_screen(sender, 'cart_change_num'))
             return
         temp_item[sender] = {'position': pos}
         user_screen[sender] = 'cart_change_qty'
@@ -1024,15 +1037,15 @@ def process_message(message):
         pos = parse_position(text)
         cart = get_cart(sender)
         if pos is None:
-            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', get_item_input_keyboard())
+            write_massage(sender, 'Номер должен быть целым положительным числом. Например: 1. Попробуйте ещё раз или нажмите «Отмена».', keyboard_for_screen(sender, 'cart_resize_num'))
             return
         if not 1 <= pos <= len(cart):
             write_massage(sender, 'Такого номера нет. Введите номер из списка.',
-                          get_item_input_keyboard())
+                          keyboard_for_screen(sender, 'cart_resize_num'))
             return
         if cart[pos - 1][1] == '-':
             write_massage(sender, 'У этого товара нет размера. Введите номер другого товара.',
-                          get_item_input_keyboard())
+                          keyboard_for_screen(sender, 'cart_resize_num'))
             return
         sizes = get_product_sizes(cart[pos - 1][0])
         temp_item[sender] = {'position': pos}
