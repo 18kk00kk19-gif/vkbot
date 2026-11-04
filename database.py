@@ -103,6 +103,16 @@ def init_db():
 
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_vk_id ON products(vk_id)')
 
+        # Раньше при отсутствии артикула подставлялся id товара VK. Такие строки (если на них
+        # нет ссылок из заказов и корзин) удаляем — правильный артикул подтянется при синхронизации.
+        cursor.execute('''
+            DELETE FROM products
+            WHERE vk_id IS NOT NULL
+              AND (article = CAST(vk_id AS TEXT) OR article = 'vk' || vk_id)
+              AND article NOT IN (SELECT article FROM order_items)
+              AND article NOT IN (SELECT article FROM cart_items)
+        ''')
+
         # Старым строкам заказов проставляем цену из каталога (один раз)
         cursor.execute('''
             UPDATE order_items
@@ -201,35 +211,41 @@ def _norm_name(name):
 def upsert_market_items(records):
     """Синхронизирует товары из VK Market с таблицей products.
 
-    records: [{'vk_id': int, 'article': str, 'name': str, 'price': int, 'sizes': [str, ...]}, ...]
+    records: [{'vk_id': int, 'article': str | None, 'name': str, 'price': int,
+               'sizes': [str, ...]}, ...]
+    Артикул — только SKU из карточки VK. id товара VK как артикул НЕ используется.
 
     Для каждого товара ищем строку в таблице: по vk_id -> по артикулу -> по названию
     (так старые товары, загруженные из Excel, не дублируются, а «привязываются» к VK).
-    Найденному обновляем название и цену; has_size и артикул не трогаем.
-    Размеры (sizes) обновляются; если они есть, товару ставится has_size = 1.
-    Новый товар получает has_size = 1, если у него есть размеры, иначе 0.
-    Возвращает (добавлено, изменено).
+    Найденному обновляем название, цену и размеры. Размер нужен (has_size = 1) только если
+    в карточке VK указаны размеры. Если у товара нет артикула и его нет в таблице —
+    он пропускается.
+    Возвращает (добавлено, изменено, пропущено).
     """
-    added = changed = 0
+    added = changed = skipped = 0
     with connect() as conn:
         cur = conn.cursor()
-        rows = cur.execute('SELECT id, article, name, price, vk_id, sizes FROM products').fetchall()
+        rows = cur.execute(
+            'SELECT id, article, name, price, vk_id, sizes, has_size FROM products'
+        ).fetchall()
         by_vk = {r[4]: r[0] for r in rows if r[4] is not None}
         by_article = {r[1]: r[0] for r in rows}
+        art_of = {r[0]: r[1] for r in rows}
         vk_of = {r[0]: r[4] for r in rows}
-        data = {r[0]: (r[2], r[3], r[5]) for r in rows}
+        data = {r[0]: (r[2], r[3], r[5], r[6]) for r in rows}
         by_name = {}
-        for pid, _, name, _, vk, _ in rows:
+        for pid, _, name, _, vk, _, _ in rows:
             if vk is None:
                 by_name.setdefault(_norm_name(name), pid)
 
         for rec in records:
-            vk_id, article, name, price = rec['vk_id'], rec['article'], rec['name'], rec['price']
+            vk_id, article, name, price = rec['vk_id'], rec.get('article'), rec['name'], rec['price']
             sizes = rec.get('sizes') or []
             sizes_json = json.dumps(sizes, ensure_ascii=False) if sizes else None
+            has_size = 1 if sizes else 0
 
             pid = by_vk.get(vk_id)
-            if pid is None:
+            if pid is None and article:
                 cand = by_article.get(article)
                 if cand is not None and vk_of.get(cand) in (None, vk_id):
                     pid = cand
@@ -239,28 +255,58 @@ def upsert_market_items(records):
                     pid = None  # эта строка уже привязана к другому товару VK
 
             if pid is not None:
-                if data[pid] != (name, price, sizes_json) or vk_of.get(pid) != vk_id:
-                    cur.execute(
-                        'UPDATE products SET vk_id = ?, name = ?, price = ?, sizes = ?, '
-                        'has_size = CASE WHEN ? IS NOT NULL THEN 1 ELSE has_size END WHERE id = ?',
-                        (vk_id, name, price, sizes_json, sizes_json, pid))
+                old_article = art_of[pid]
+                # Исправляем артикул, который раньше подставили как id товара VK
+                if (article and article != old_article and old_article == str(vk_id)
+                        and article not in by_article):
+                    cur.execute('UPDATE products SET article = ? WHERE id = ?', (article, pid))
+                    cur.execute('UPDATE order_items SET article = ? WHERE article = ?',
+                                (article, old_article))
+                    cur.execute('UPDATE cart_items SET article = ? WHERE article = ?',
+                                (article, old_article))
+                    by_article.pop(old_article, None)
+                    by_article[article] = pid
+                    art_of[pid] = article
                     changed += 1
-                data[pid] = (name, price, sizes_json)
+                if data[pid] != (name, price, sizes_json, has_size) or vk_of.get(pid) != vk_id:
+                    cur.execute(
+                        'UPDATE products SET vk_id = ?, name = ?, price = ?, sizes = ?, has_size = ? '
+                        'WHERE id = ?', (vk_id, name, price, sizes_json, has_size, pid))
+                    changed += 1
+                data[pid] = (name, price, sizes_json, has_size)
             else:
-                if article in by_article:   # такой SKU уже занят другим товаром
-                    article = f'vk{vk_id}'
+                if not article or article in by_article:
+                    skipped += 1    # нет артикула (или SKU занят другим товаром VK)
+                    continue
                 cur.execute(
                     'INSERT INTO products (article, name, price, has_size, vk_id, sizes) '
                     'VALUES (?, ?, ?, ?, ?, ?)',
-                    (article, name, price, 1 if sizes else 0, vk_id, sizes_json)
+                    (article, name, price, has_size, vk_id, sizes_json)
                 )
                 pid = cur.lastrowid
                 by_article[article] = pid
-                data[pid] = (name, price, sizes_json)
+                art_of[pid] = article
+                data[pid] = (name, price, sizes_json, has_size)
                 added += 1
             by_vk[vk_id] = pid
             vk_of[pid] = vk_id
-    return added, changed
+    return added, changed, skipped
+
+
+def get_all_products():
+    """Весь каталог для экспорта: [(article, name, price, has_size, [sizes], vk_id), ...]."""
+    with connect() as conn:
+        rows = conn.execute(
+            'SELECT article, name, price, has_size, sizes, vk_id FROM products ORDER BY id'
+        ).fetchall()
+    result = []
+    for article, name, price, has_size, sizes, vk_id in rows:
+        try:
+            size_list = json.loads(sizes) if sizes else []
+        except json.JSONDecodeError:
+            size_list = []
+        result.append((article, name, price, has_size, size_list, vk_id))
+    return result
 
 
 # ---------------------------------------------------------------- корзина

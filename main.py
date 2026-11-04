@@ -16,7 +16,7 @@ from vk_api.utils import get_random_id
 
 from database import (
     STATUS_DELIVERED,
-    add_to_cart, checkout_cart, clear_cart, get_cart, get_order,
+    add_to_cart, checkout_cart, clear_cart, get_all_products, get_cart, get_order,
     get_order_items, get_order_total, get_orders_for_export, get_product,
     get_product_by_vk_id, get_product_sizes, init_db, load_all_states, remove_cart_item, save_state,
     set_status, update_cart_quantity, update_cart_size, upsert_market_items,
@@ -63,9 +63,9 @@ ADMIN_ID = 588644580
 MAX_QTY = 99          # максимум штук одной позиции за раз
 MAX_SIZE_LEN = 20     # максимальная длина размера
 CATALOG_SYNC_INTERVAL = 30 * 60   # как часто обновлять каталог из VK Market (секунды)
-MARKET_DEBUG = True   # присылать админу «сырые» данные товара из VK (для отладки)
 
 ORDERS_XLSX = os.path.join(BASE_DIR, 'orders.xlsx')
+CATALOG_XLSX = os.path.join(BASE_DIR, 'catalog.xlsx')
 QR_PATH = os.path.join(BASE_DIR, 'qr-code.png')
 
 auth = vk_api.VkApi(token=GROUP_TOKEN)          # для сообщений
@@ -163,6 +163,9 @@ def go_main_menu(sender, text='Главное меню:'):
 
 # ------------------------------------------------------------------ каталог
 
+NO_SIZE_WORDS = {'-', '—', '–', 'нет', 'б/р', 'без размера', 'one size', 'onesize'}
+
+
 def parse_sizes(description):
     """Размеры из описания товара: строка вида «Размер: 41, 43, 45» -> ['41', '43', '45']."""
     m = re.search(r'^[ \t]*Размеры?[ \t]*:[ \t]*(.+)$', description or '', re.IGNORECASE | re.MULTILINE)
@@ -171,7 +174,8 @@ def parse_sizes(description):
     sizes = []
     for part in re.split(r'[,;]', m.group(1)):
         part = part.strip()
-        if part and len(part) <= MAX_SIZE_LEN and part not in sizes:
+        if (part and len(part) <= MAX_SIZE_LEN and part not in sizes
+                and part.casefold() not in NO_SIZE_WORDS):
             sizes.append(part)
     return sizes
 
@@ -186,7 +190,8 @@ def match_size(sizes, text):
 
 def market_item_record(item):
     """Товар из VK Market (market.get / market.getById) -> запись для таблицы products.
-    Артикул = SKU из VK; если SKU не заполнен, используем id товара в VK."""
+    Артикул = только SKU из карточки VK (или «Артикул: …» в описании).
+    Если артикула нет — article = None. id товара VK артикулом не считается."""
     sku = str(item.get('sku') or '').strip()
     if sku.lower() == 'none':
         sku = ''
@@ -202,7 +207,7 @@ def market_item_record(item):
         price = 0
     return {
         'vk_id': item['id'],
-        'article': sku or str(item['id']),
+        'article': sku or None,
         'name': str(item.get('title') or 'Товар').strip(),
         'price': price,
         'sizes': parse_sizes(item.get('description')),
@@ -229,15 +234,18 @@ def fetch_market_catalog():
 
 def sync_catalog():
     """Подтягивает каталог из VK Market в таблицу products.
-    Возвращает (добавлено, изменено, всего в VK) или None, если VK ничего не вернул."""
+    Возвращает (добавлено, изменено, пропущено без артикула, всего в VK)
+    или None, если VK ничего не вернул."""
     items = fetch_market_catalog()
     if not items:
         print('Каталог VK Market пуст или недоступен — таблица products не тронута.')
         return None
     records = [market_item_record(i) for i in items if i.get('id')]
-    added, changed = upsert_market_items(records)
-    print(f'Каталог синхронизирован: в VK {len(records)}, добавлено {added}, изменено {changed}.')
-    return added, changed, len(records)
+    no_article = sum(1 for r in records if not r['article'])
+    added, changed, skipped = upsert_market_items(records)
+    print(f'Каталог синхронизирован: в VK {len(records)}, добавлено {added}, изменено {changed}, '
+          f'пропущено (нет артикула) {skipped}; без артикула в VK: {no_article}.')
+    return added, changed, skipped, len(records)
 
 
 def catalog_sync_loop():
@@ -414,9 +422,7 @@ def extract_market_item(attachments):
                 'extended': 1,
             })
             if response.get('items'):
-                item = response['items'][0]
-                item['_raw_attachment'] = market_data   # только для отладки
-                return item
+                return response['items'][0]
         except Exception as e:
             print(f'Ошибка market.getById: {e}')
     return None
@@ -428,15 +434,14 @@ def handle_market_item(sender, market_item):
     record = market_item_record(market_item)
     # Товар мог появиться в VK после последней синхронизации — добавляем/обновляем сразу.
     upsert_market_items([record])
-    article, title, price, _ = get_product_by_vk_id(record['vk_id'])
+    product = get_product_by_vk_id(record['vk_id'])
+    if not product:
+        write_massage(sender, 'У этого товара в каталоге не указан артикул, поэтому добавить его '
+                              'в корзину нельзя. Напишите администратору.', get_main_keyboard())
+        reset_state(sender)
+        return
+    article, title, price, _ = product
     sizes = get_product_sizes(article)
-
-    if MARKET_DEBUG:
-        raw = json.dumps(market_item, ensure_ascii=False, default=str)
-        print('MARKET ITEM RAW:', raw)
-        if sender == ADMIN_ID:
-            for i in range(0, len(raw), 3500):
-                write_massage(sender, 'DEBUG market item:\n' + raw[i:i + 3500])
 
     pending_market[sender] = {'article': article, 'title': title, 'price': price}
     user_screen[sender] = 'market_confirm'
@@ -649,6 +654,50 @@ def export_orders_to_excel(path=ORDERS_XLSX):
         return None
 
 
+def export_catalog_to_excel(path=CATALOG_XLSX):
+    """Экспортирует каталог товаров в Excel. Возвращает число товаров или None, если файл не сохранился."""
+    products = get_all_products()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Каталог'
+
+    headers = ['Артикул', 'Название', 'Цена', 'Нужен размер', 'Размеры', 'Ссылка на товар']
+    widths = [16, 70, 12, 14, 28, 50]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = f'A1:{get_column_letter(len(headers))}1'
+
+    for article, name, price, has_size, sizes, vk_id in products:
+        link = f'https://vk.com/market-{GROUP_ID}?w=product-{GROUP_ID}_{vk_id}' if vk_id else None
+        ws.append([
+            article,
+            name,
+            price,
+            'да' if has_size else 'нет',
+            ', '.join(sizes),
+            link or '— нет в VK —',
+        ])
+        row = ws.max_row
+        ws.cell(row, 1).number_format = '@'          # артикул — текстом (чтобы не терять нули в начале)
+        ws.cell(row, 3).number_format = '#,##0 "₽"'
+        if link:
+            ws.cell(row, 6).hyperlink = link
+            ws.cell(row, 6).font = Font(color='0563C1', underline='single')
+
+    try:
+        wb.save(path)
+        return len(products)
+    except PermissionError:
+        print(f'Не удалось сохранить {path} — файл открыт в Excel.')
+        return None
+
+
 # ------------------------------------------------------------------ команды админа
 
 def handle_admin_command(sender, text):
@@ -677,9 +726,26 @@ def handle_admin_command(sender, text):
         if result is None:
             write_massage(sender, 'VK Market не вернул товаров — таблица не изменена.')
         else:
-            added, changed, total = result
-            write_massage(sender, f'✅ Каталог обновлён.\nТоваров в VK: {total}\n'
-                                  f'Добавлено новых: {added}\nИзменено (название/цена): {changed}')
+            added, changed, skipped, total = result
+            text = (f'✅ Каталог обновлён.\nТоваров в VK: {total}\n'
+                    f'Добавлено новых: {added}\nИзменено: {changed}')
+            if skipped:
+                text += f'\nПропущено (в карточке нет артикула): {skipped}'
+            write_massage(sender, text)
+        return
+
+    if text.lower() == '/catalog':
+        count = export_catalog_to_excel()
+        if count is None:
+            write_massage(sender, 'Не удалось сохранить catalog.xlsx — закройте файл в Excel и повторите.')
+        else:
+            caption = f'Товаров в каталоге: {count}'
+            try:
+                send_file(sender, CATALOG_XLSX, caption)
+            except Exception as e:
+                print(f'Не удалось отправить catalog.xlsx: {e}')
+                write_massage(sender, f'{caption}\nФайл сохранён на сервере (catalog.xlsx), '
+                                      f'но отправить его в чат не получилось: {e}')
         return
 
     m = re.fullmatch(r'/delivered(?:\s+(.*))?', text, re.IGNORECASE | re.DOTALL)
@@ -704,6 +770,7 @@ def handle_admin_command(sender, text):
                           'Доступные команды администратора:\n'
                           '/export — выгрузить заказы в orders.xlsx (без дополнительных параметров)\n'
                           '/sync — сразу обновить каталог из VK Market\n'
+                          '/catalog — выгрузить каталог товаров в catalog.xlsx\n'
                           '/delivered N — отметить заказ №N доставленным и уведомить покупателя\n'
                           '/delivered N M K — отметить несколько заказов (номера через пробел или запятую).')
 
