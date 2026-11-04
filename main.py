@@ -18,7 +18,7 @@ from database import (
     STATUS_DELIVERED,
     add_to_cart, checkout_cart, clear_cart, get_all_products, get_cart, get_order,
     get_order_items, get_order_total, get_orders_for_export, get_product,
-    get_product_by_vk_id, get_product_sizes, init_db, load_all_states, remove_cart_item, save_state,
+    get_product_by_vk_id, get_product_sizes, init_db, is_real_article, load_all_states, remove_cart_item, save_state,
     set_status, update_cart_quantity, update_cart_size, upsert_market_items,
 )
 from keyboards import (
@@ -191,7 +191,7 @@ def match_size(sizes, text):
 def market_item_record(item):
     """Товар из VK Market (market.get / market.getById) -> запись для таблицы products.
     Артикул = только SKU из карточки VK (или «Артикул: …» в описании).
-    Если артикула нет — article = None. id товара VK артикулом не считается."""
+    Если артикула нет — article = None (в базе такой товар получит скрытый внутренний ключ)."""
     sku = str(item.get('sku') or '').strip()
     if sku.lower() == 'none':
         sku = ''
@@ -234,18 +234,17 @@ def fetch_market_catalog():
 
 def sync_catalog():
     """Подтягивает каталог из VK Market в таблицу products.
-    Возвращает (добавлено, изменено, пропущено без артикула, всего в VK)
+    Возвращает (добавлено, изменено, пришло без артикула, всего в VK)
     или None, если VK ничего не вернул."""
     items = fetch_market_catalog()
     if not items:
         print('Каталог VK Market пуст или недоступен — таблица products не тронута.')
         return None
     records = [market_item_record(i) for i in items if i.get('id')]
-    no_article = sum(1 for r in records if not r['article'])
-    added, changed, skipped = upsert_market_items(records)
+    added, changed, no_article = upsert_market_items(records)
     print(f'Каталог синхронизирован: в VK {len(records)}, добавлено {added}, изменено {changed}, '
-          f'пропущено (нет артикула) {skipped}; без артикула в VK: {no_article}.')
-    return added, changed, skipped, len(records)
+          f'без артикула в VK: {no_article}.')
+    return added, changed, no_article, len(records)
 
 
 def catalog_sync_loop():
@@ -432,12 +431,16 @@ def handle_market_item(sender, market_item):
     """Пользователь прислал товар из Market: обновляем каталог по свежим данным ВК
     и показываем карточку с кнопками."""
     record = market_item_record(market_item)
+    print(f"[VK MARKET] {record['name']} | id VK: {record['vk_id']} | "
+          f"sku из API: {market_item.get('sku')!r} | артикул: {record['article']!r}")
+    if not market_item.get('sku'):
+        print(f"[VK MARKET] sku в ответе нет. Поля ответа: {sorted(market_item.keys())}")
     # Товар мог появиться в VK после последней синхронизации — добавляем/обновляем сразу.
     upsert_market_items([record])
     product = get_product_by_vk_id(record['vk_id'])
     if not product:
-        write_massage(sender, 'У этого товара в каталоге не указан артикул, поэтому добавить его '
-                              'в корзину нельзя. Напишите администратору.', get_main_keyboard())
+        write_massage(sender, 'Не удалось добавить этот товар. Пришлите карточку ещё раз '
+                              'или напишите администратору.', get_main_keyboard())
         reset_state(sender)
         return
     article, title, price, _ = product
@@ -451,7 +454,7 @@ def handle_market_item(sender, market_item):
         f'Вы прислали товар:\n'
         f'📦 {title}\n'
         f'💰 Цена: {price} ₽\n'
-        f'🆔 Артикул: {article}\n'
+        + (f'🆔 Артикул: {article}\n' if is_real_article(article) else '')
         + (f'📏 Размеры: {", ".join(sizes)}\n' if sizes else '')
         + '\nДобавить его в корзину?',
         get_market_confirm_keyboard(article)
@@ -676,7 +679,7 @@ def export_catalog_to_excel(path=CATALOG_XLSX):
     for article, name, price, has_size, sizes, vk_id in products:
         link = f'https://vk.com/market-{GROUP_ID}?w=product-{GROUP_ID}_{vk_id}' if vk_id else None
         ws.append([
-            article,
+            article if is_real_article(article) else '',
             name,
             price,
             'да' if has_size else 'нет',
@@ -726,11 +729,11 @@ def handle_admin_command(sender, text):
         if result is None:
             write_massage(sender, 'VK Market не вернул товаров — таблица не изменена.')
         else:
-            added, changed, skipped, total = result
+            added, changed, no_article, total = result
             text = (f'✅ Каталог обновлён.\nТоваров в VK: {total}\n'
                     f'Добавлено новых: {added}\nИзменено: {changed}')
-            if skipped:
-                text += f'\nПропущено (в карточке нет артикула): {skipped}'
+            if no_article:
+                text += f'\nVK не отдал артикул у {no_article} товаров (они добавлены без артикула)'
             write_massage(sender, text)
         return
 
@@ -1071,12 +1074,14 @@ def process_message(message):
 
     # --- Шаги ввода товара ---
     if screen == 'cart_article':
-        product = get_product(text)
+        article = text.strip()
+        product = get_product(article) if is_real_article(article) else None
         if not product:
-            write_massage(sender, 'Такого артикула нет. Попробуйте другой.',
-                          get_item_input_keyboard())
+            write_massage(sender, '❌ Артикул не верный: товара с таким артикулом нет в каталоге.\n'
+                                  'Проверьте артикул на странице товара и введите его ещё раз '
+                                  'или нажмите «Отмена».', get_item_input_keyboard())
             return
-        ask_item_details(sender, text, product)
+        ask_item_details(sender, article, product)
         return
 
     if screen == 'cart_size':
