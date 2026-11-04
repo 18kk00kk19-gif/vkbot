@@ -17,14 +17,15 @@ from vk_api.utils import get_random_id
 from database import (
     STATUS_DELIVERED,
     add_to_cart, checkout_cart, clear_cart, get_all_products, get_cart, get_order,
-    get_order_items, get_order_total, get_orders_for_export, get_product,
+    get_order_items, get_order_total, get_orders_for_export, get_processing_orders, get_product,
     get_product_by_vk_id, get_product_sizes, init_db, is_real_article, load_all_states, remove_cart_item, save_state,
     set_status, update_cart_quantity, update_cart_size, upsert_market_items,
 )
 from keyboards import (
-    get_cart_edit_keyboard, get_cart_keyboard, get_item_input_keyboard,
+    get_admin_keyboard, get_cart_edit_keyboard, get_cart_keyboard, get_item_input_keyboard,
     get_main_keyboard, get_market_confirm_keyboard,
-    get_number_keyboard, get_payment_confirmation_keyboard, get_payment_keyboard,
+    get_number_keyboard, get_order_pick_keyboard, get_payment_confirmation_keyboard,
+    get_payment_keyboard,
     get_size_keyboard,
 )
 
@@ -715,9 +716,70 @@ def export_catalog_to_excel(path=CATALOG_XLSX):
         return None
 
 
+# ------------------------------------------------------------------ меню админа (кнопки)
+
+def show_admin_menu(sender, text='Меню администратора:'):
+    user_screen[sender] = 'admin_menu'
+    write_massage(sender, text, get_admin_keyboard())
+
+
+def show_orders_to_deliver(sender):
+    """Список заказов «В обработке» с кнопками-номерами."""
+    orders = get_processing_orders()
+    if not orders:
+        show_admin_menu(sender, 'Заказов в обработке нет.')
+        return
+    user_screen[sender] = 'admin_delivered'
+    lines = [f'№{order_id} — {name or "—"} — {get_order_total(order_id)} ₽'
+             for order_id, name in orders]
+    write_massage(sender,
+                  'Заказы в обработке:\n' + '\n'.join(lines) +
+                  '\n\nНажмите номер заказа, который доставлен (покупатель получит уведомление).',
+                  get_order_pick_keyboard([order_id for order_id, _ in orders]))
+
+
+def handle_admin_menu(sender, text, screen):
+    """Кнопки меню администратора."""
+    if text in ('Начать', 'Выйти из админ-меню'):
+        go_main_menu(sender, 'Главное меню:')
+        return
+
+    if screen == 'admin_delivered':
+        if text == 'Назад':
+            show_admin_menu(sender)
+            return
+        m = re.fullmatch(r'№?\s*(\d+)', text)
+        if m:
+            write_massage(sender, mark_delivered(int(m.group(1))))
+            show_orders_to_deliver(sender)   # обновлённый список
+            return
+        write_massage(sender, 'Нажмите номер заказа или «Назад».',
+                      get_order_pick_keyboard([o for o, _ in get_processing_orders()]))
+        return
+
+    # screen == 'admin_menu'
+    commands = {
+        'Выгрузить заказы': '/export',
+        'Каталог в Excel': '/catalog',
+        'Обновить каталог': '/sync',
+    }
+    if text in commands:
+        handle_admin_command(sender, commands[text])
+        return
+    if text == 'Заказ доставлен':
+        show_orders_to_deliver(sender)
+        return
+    write_massage(sender, 'Выберите действие кнопкой или нажмите «Выйти из админ-меню».',
+                  get_admin_keyboard())
+
+
 # ------------------------------------------------------------------ команды админа
 
 def handle_admin_command(sender, text):
+    if text.lower() in ('/admin', '/menu'):
+        show_admin_menu(sender)
+        return
+
     if text.lower() == '/export':
         count = export_orders_to_excel()
         if count is None:
@@ -785,6 +847,7 @@ def handle_admin_command(sender, text):
 
     write_massage(sender, 'Команда не распознана или введена неправильно.\n\n'
                           'Доступные команды администратора:\n'
+                          '/admin — открыть меню администратора с кнопками\n'
                           '/export — выгрузить заказы в orders.xlsx (без дополнительных параметров)\n'
                           '/sync — сразу обновить каталог из VK Market\n'
                           '/catalog — выгрузить каталог товаров в catalog.xlsx\n'
@@ -859,6 +922,11 @@ def process_message(message):
     # --- Команды админа ---
     if sender == ADMIN_ID and text.startswith('/'):
         handle_admin_command(sender, text)
+        return
+
+    # --- Кнопки меню администратора ---
+    if sender == ADMIN_ID and screen in ('admin_menu', 'admin_delivered'):
+        handle_admin_menu(sender, text, screen)
         return
 
     # --- Ожидание чека: принимаем только фото ---

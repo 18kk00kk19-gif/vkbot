@@ -92,3 +92,29 @@ def get_number_keyboard(numbers):
     keyboard.add_line()
     keyboard.add_button('Отмена', color=VkKeyboardColor.NEGATIVE)
     return keyboard
+
+
+def get_admin_keyboard():
+    """Меню администратора."""
+    keyboard = VkKeyboard(one_time=False)
+    keyboard.add_button('Заказ доставлен', color=VkKeyboardColor.POSITIVE)
+    keyboard.add_line()
+    keyboard.add_button('Выгрузить заказы', color=VkKeyboardColor.PRIMARY)
+    keyboard.add_button('Каталог в Excel', color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button('Обновить каталог', color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button('Выйти из админ-меню', color=VkKeyboardColor.SECONDARY)
+    return keyboard
+
+
+def get_order_pick_keyboard(order_ids):
+    """Кнопки с номерами заказов «№5» (по 3 в ряд) и «Назад». До 30 заказов — лимит VK на размер клавиатуры."""
+    keyboard = VkKeyboard(one_time=False)
+    for i, order_id in enumerate(order_ids[:30]):
+        if i and i % 3 == 0:
+            keyboard.add_line()
+        keyboard.add_button(f'№{order_id}', color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button('Назад', color=VkKeyboardColor.SECONDARY)
+    return keyboard

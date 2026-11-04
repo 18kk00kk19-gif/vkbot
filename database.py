@@ -492,6 +492,15 @@ def set_status(order_id, status):
         return cursor.rowcount > 0
 
 
+def get_processing_orders(limit=30):
+    """Заказы в обработке (старые первыми): [(id, user_name), ...]."""
+    with connect() as conn:
+        return conn.execute(
+            'SELECT id, user_name FROM orders WHERE status = ? ORDER BY id LIMIT ?',
+            (STATUS_PROCESSING, limit)
+        ).fetchall()
+
+
 def get_orders_for_export():
     """Все заказы (новые сверху) со списком товаров и суммой:
     [{'id', 'user_id', 'user_name', 'status', 'payment_photo', 'items', 'total'}, ...]"""
