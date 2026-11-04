@@ -93,11 +93,14 @@ def init_db():
             'ALTER TABLE orders ADD COLUMN user_name TEXT',
             'ALTER TABLE orders ADD COLUMN payment_photo TEXT',
             'ALTER TABLE order_items ADD COLUMN price INTEGER',  # цена на момент заказа
+            'ALTER TABLE products ADD COLUMN vk_id INTEGER',     # id товара в VK Market
         ]:
             try:
                 cursor.execute(col_sql)
             except sqlite3.OperationalError:
                 pass  # колонка уже существует
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_vk_id ON products(vk_id)')
 
         # Старым строкам заказов проставляем цену из каталога (один раз)
         cursor.execute('''
@@ -168,13 +171,76 @@ def get_product(article):
         ).fetchone()
 
 
-def get_product_by_name(name):
-    """Ищет товар по названию (без учёта регистра и пробелов). Возвращает (article, price, has_size)."""
+def get_product_by_vk_id(vk_id):
+    """Возвращает (article, name, price, has_size) по id товара в VK Market, либо None."""
     with connect() as conn:
         return conn.execute(
-            'SELECT article, price, has_size FROM products '
-            'WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))', (name,)
+            'SELECT article, name, price, has_size FROM products WHERE vk_id = ?', (vk_id,)
         ).fetchone()
+
+
+def _norm_name(name):
+    # casefold() работает с кириллицей, в отличие от SQLite LOWER()
+    return ' '.join((name or '').split()).casefold()
+
+
+def upsert_market_items(records):
+    """Синхронизирует товары из VK Market с таблицей products.
+
+    records: [{'vk_id': int, 'article': str, 'name': str, 'price': int}, ...]
+
+    Для каждого товара ищем строку в таблице: по vk_id -> по артикулу -> по названию
+    (так старые товары, загруженные из Excel, не дублируются, а «привязываются» к VK).
+    Найденному обновляем название и цену; has_size и артикул не трогаем.
+    Новый товар добавляется с has_size = 1.
+    Возвращает (добавлено, изменено).
+    """
+    added = changed = 0
+    with connect() as conn:
+        cur = conn.cursor()
+        rows = cur.execute('SELECT id, article, name, price, vk_id FROM products').fetchall()
+        by_vk = {r[4]: r[0] for r in rows if r[4] is not None}
+        by_article = {r[1]: r[0] for r in rows}
+        vk_of = {r[0]: r[4] for r in rows}
+        data = {r[0]: (r[2], r[3]) for r in rows}
+        by_name = {}
+        for pid, _, name, _, vk in rows:
+            if vk is None:
+                by_name.setdefault(_norm_name(name), pid)
+
+        for rec in records:
+            vk_id, article, name, price = rec['vk_id'], rec['article'], rec['name'], rec['price']
+
+            pid = by_vk.get(vk_id)
+            if pid is None:
+                cand = by_article.get(article)
+                if cand is not None and vk_of.get(cand) in (None, vk_id):
+                    pid = cand
+            if pid is None:
+                pid = by_name.pop(_norm_name(name), None)
+                if pid is not None and vk_of.get(pid) is not None:
+                    pid = None  # эта строка уже привязана к другому товару VK
+
+            if pid is not None:
+                if data[pid] != (name, price) or vk_of.get(pid) != vk_id:
+                    cur.execute('UPDATE products SET vk_id = ?, name = ?, price = ? WHERE id = ?',
+                                (vk_id, name, price, pid))
+                    changed += 1
+                data[pid] = (name, price)
+            else:
+                if article in by_article:   # такой SKU уже занят другим товаром
+                    article = f'vk{vk_id}'
+                cur.execute(
+                    'INSERT INTO products (article, name, price, has_size, vk_id) '
+                    'VALUES (?, ?, ?, 1, ?)', (article, name, price, vk_id)
+                )
+                pid = cur.lastrowid
+                by_article[article] = pid
+                data[pid] = (name, price)
+                added += 1
+            by_vk[vk_id] = pid
+            vk_of[pid] = vk_id
+    return added, changed
 
 
 # ---------------------------------------------------------------- корзина

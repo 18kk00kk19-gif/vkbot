@@ -3,10 +3,11 @@ import os
 import re
 import sys
 import time
+import threading
 import traceback
 
 import vk_api
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from vk_api.bot_longpoll import VkBotEventType, VkBotLongPoll
@@ -15,10 +16,10 @@ from vk_api.utils import get_random_id
 
 from database import (
     STATUS_DELIVERED,
-    add_product, add_to_cart, checkout_cart, clear_cart, get_cart, get_order,
+    add_to_cart, checkout_cart, clear_cart, get_cart, get_order,
     get_order_items, get_order_total, get_orders_for_export, get_product,
-    get_product_by_name, init_db, load_all_states, remove_cart_item, save_state,
-    set_status, update_cart_quantity, update_cart_size,
+    get_product_by_vk_id, init_db, load_all_states, remove_cart_item, save_state,
+    set_status, update_cart_quantity, update_cart_size, upsert_market_items,
 )
 from keyboards import (
     get_cart_edit_keyboard, get_cart_keyboard, get_item_input_keyboard,
@@ -61,8 +62,8 @@ ADMIN_ID = 588644580
 
 MAX_QTY = 99          # максимум штук одной позиции за раз
 MAX_SIZE_LEN = 20     # максимальная длина размера
+CATALOG_SYNC_INTERVAL = 30 * 60   # как часто обновлять каталог из VK Market (секунды)
 
-PRODUCTS_XLSX = os.path.join(BASE_DIR, 'products.xlsx')
 ORDERS_XLSX = os.path.join(BASE_DIR, 'orders.xlsx')
 QR_PATH = os.path.join(BASE_DIR, 'qr-code.png')
 
@@ -158,32 +159,64 @@ def go_main_menu(sender, text='Главное меню:'):
 
 # ------------------------------------------------------------------ каталог
 
-def load_products_from_excel(path=PRODUCTS_XLSX):
-    """Загружает каталог из Excel: article | name | price | has_size."""
+def market_item_record(item):
+    """Товар из VK Market (market.get / market.getById) -> запись для таблицы products.
+    Артикул = SKU из VK; если SKU не заполнен, используем id товара в VK."""
+    sku = str(item.get('sku') or '').strip()
+    if sku.lower() == 'none':
+        sku = ''
+    price_data = item.get('price') or {}
     try:
-        wb = load_workbook(path)
-    except FileNotFoundError:
-        print(f'Файл {path} не найден — пропускаю загрузку.')
-        return
+        price = int(price_data.get('amount', 0)) // 100   # VK отдаёт цену в копейках
+    except (TypeError, ValueError, AttributeError):
+        price = 0
+    return {
+        'vk_id': item['id'],
+        'article': sku or str(item['id']),
+        'name': str(item.get('title') or 'Товар').strip(),
+        'price': price,
+    }
 
-    def clean_article(value):
-        if isinstance(value, float) and value.is_integer():
-            value = int(value)
-        return str(value).strip() if value is not None else None
 
-    ws = wb.active
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        article = clean_article(row[0])
-        name = str(row[1]).strip() if row[1] else None
-        if not article or not name:
-            continue
+def fetch_market_catalog():
+    """Скачивает все товары сообщества из VK Market (постранично по 200)."""
+    items, offset = [], 0
+    while True:
+        resp = user_auth.method('market.get', {
+            'owner_id': -GROUP_ID,
+            'count': 200,
+            'offset': offset,
+        })
+        batch = resp.get('items', [])
+        items.extend(batch)
+        offset += len(batch)
+        if not batch or offset >= resp.get('count', 0):
+            break
+        time.sleep(0.4)   # лимит VK для пользовательского токена — 3 запроса в секунду
+    return items
 
-        price = row[2]
-        has_size_raw = row[3] if len(row) > 3 else None
-        # Пустая ячейка = 1 (нужен размер). 0 остаётся 0.
-        has_size = 1 if has_size_raw in (None, '') else int(has_size_raw)
 
-        add_product(article, name, int(price or 0), has_size)
+def sync_catalog():
+    """Подтягивает каталог из VK Market в таблицу products.
+    Возвращает (добавлено, изменено, всего в VK) или None, если VK ничего не вернул."""
+    items = fetch_market_catalog()
+    if not items:
+        print('Каталог VK Market пуст или недоступен — таблица products не тронута.')
+        return None
+    records = [market_item_record(i) for i in items if i.get('id')]
+    added, changed = upsert_market_items(records)
+    print(f'Каталог синхронизирован: в VK {len(records)}, добавлено {added}, изменено {changed}.')
+    return added, changed, len(records)
+
+
+def catalog_sync_loop():
+    """Фоновый поток: обновляет каталог при старте и затем раз в CATALOG_SYNC_INTERVAL секунд."""
+    while True:
+        try:
+            sync_catalog()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(CATALOG_SYNC_INTERVAL)
 
 
 # ------------------------------------------------------------------ отправка
@@ -352,33 +385,12 @@ def extract_market_item(attachments):
 
 
 def handle_market_item(sender, market_item):
-    """Пользователь прислал товар из Market: показываем карточку с кнопками."""
-    item_id = market_item['id']
-    title = str(market_item.get('title', 'Товар')).strip()
-
-    price_data = market_item.get('price', {})
-    price_amount = price_data.get('amount', 0) if isinstance(price_data, dict) else 0
-    price = int(price_amount) // 100
-
-    sku = market_item.get('sku')
-    article = None
-
-    # 1. Ищем по названию в каталоге (самый надёжный способ)
-    found_by_name = get_product_by_name(title)
-    if found_by_name:
-        article = found_by_name[0]
-    # 2. Если нет — проверяем SKU из ВК
-    elif sku and str(sku).strip() and str(sku).lower() != 'none':
-        if get_product(str(sku).strip()):
-            article = str(sku).strip()
-
-    if article:
-        # Товар есть в каталоге — обновляем цену и название (вдруг поменяли в ВК)
-        has_size = get_product(article)[2]
-        add_product(article, title, price, has_size=has_size)
-    else:
-        # Товара нет в каталоге — используем ID из ВК, в базу попадёт только после «В корзину»
-        article = str(item_id)
+    """Пользователь прислал товар из Market: обновляем каталог по свежим данным ВК
+    и показываем карточку с кнопками."""
+    record = market_item_record(market_item)
+    # Товар мог появиться в VK после последней синхронизации — добавляем/обновляем сразу.
+    upsert_market_items([record])
+    article, title, price, _ = get_product_by_vk_id(record['vk_id'])
 
     pending_market[sender] = {'article': article, 'title': title, 'price': price}
     user_screen[sender] = 'market_confirm'
@@ -399,20 +411,14 @@ def handle_add_market_to_cart(sender, article):
     product = get_product(article)
 
     if not product:
-        # Товара нет в каталоге — добавляем его из данных, которые прислал ВК
-        pending = pending_market.get(sender)
-        if pending and pending['article'] == article and pending['price'] > 0:
-            add_product(article, pending['title'], pending['price'], has_size=1)
-            product = get_product(article)
-        elif pending and pending['article'] == article:
-            write_massage(sender, 'У этого товара не указана цена, добавить его в корзину нельзя. '
-                                  'Напишите администратору.', get_main_keyboard())
-            reset_state(sender)
-            return
-
-    if not product:
         write_massage(sender, 'Товар не найден. Пришлите его ещё раз или введите артикул '
                               'через «Корзина» → «Добавить товар».', get_main_keyboard())
+        reset_state(sender)
+        return
+
+    if not product[1]:
+        write_massage(sender, 'У этого товара не указана цена, добавить его в корзину нельзя. '
+                              'Напишите администратору.', get_main_keyboard())
         reset_state(sender)
         return
 
@@ -613,6 +619,22 @@ def handle_admin_command(sender, text):
                                       f'но отправить его в чат не получилось: {e}')
         return
 
+    if text.lower() == '/sync':
+        write_massage(sender, 'Обновляю каталог из VK Market, это может занять до минуты...')
+        try:
+            result = sync_catalog()
+        except Exception as e:
+            print(f'Ошибка синхронизации каталога: {e}')
+            write_massage(sender, f'Не удалось обновить каталог: {e}')
+            return
+        if result is None:
+            write_massage(sender, 'VK Market не вернул товаров — таблица не изменена.')
+        else:
+            added, changed, total = result
+            write_massage(sender, f'✅ Каталог обновлён.\nТоваров в VK: {total}\n'
+                                  f'Добавлено новых: {added}\nИзменено (название/цена): {changed}')
+        return
+
     m = re.fullmatch(r'/delivered(?:\s+(.*))?', text, re.IGNORECASE | re.DOTALL)
     if m:
         rest = (m.group(1) or '').strip()
@@ -634,6 +656,7 @@ def handle_admin_command(sender, text):
     write_massage(sender, 'Команда не распознана или введена неправильно.\n\n'
                           'Доступные команды администратора:\n'
                           '/export — выгрузить заказы в orders.xlsx (без дополнительных параметров)\n'
+                          '/sync — сразу обновить каталог из VK Market\n'
                           '/delivered N — отметить заказ №N доставленным и уведомить покупателя\n'
                           '/delivered N M K — отметить несколько заказов (номера через пробел или запятую).')
 
@@ -966,7 +989,7 @@ def process_message(message):
 def main():
     init_db()
     load_saved_states()
-    load_products_from_excel()
+    threading.Thread(target=catalog_sync_loop, daemon=True).start()
     print('Бот запущен.')
 
     while True:
