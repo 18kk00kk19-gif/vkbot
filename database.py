@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 
@@ -10,10 +11,17 @@ STATUS_PROCESSING = 'В обработке'
 STATUS_DELIVERED = 'Доставлен'
 
 
+def is_real_article(article):
+    """True, если это настоящий артикул. Внутренний ключ вида «vk123» (товар без артикула
+    в VK) артикулом не считается и покупателю не показывается."""
+    return bool(article) and not re.fullmatch(r'vk\d+', str(article))
+
+
 @contextmanager
 def connect():
     """Соединение с базой: commit при успехе, rollback при ошибке, close всегда."""
-    conn = sqlite3.connect(DB_PATH)
+    # timeout: фоновая синхронизация каталога и обработка сообщений пишут в одну базу
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
         yield conn
         conn.commit()
@@ -103,12 +111,12 @@ def init_db():
 
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_vk_id ON products(vk_id)')
 
-        # Раньше при отсутствии артикула подставлялся id товара VK. Такие строки (если на них
-        # нет ссылок из заказов и корзин) удаляем — правильный артикул подтянется при синхронизации.
+        # В ранних версиях вместо артикула подставлялся «голый» id товара VK. Такие строки (если на них
+        # нет ссылок из заказов и корзин) удаляем — товар снова добавится при синхронизации.
         cursor.execute('''
             DELETE FROM products
             WHERE vk_id IS NOT NULL
-              AND (article = CAST(vk_id AS TEXT) OR article = 'vk' || vk_id)
+              AND article = CAST(vk_id AS TEXT)
               AND article NOT IN (SELECT article FROM order_items)
               AND article NOT IN (SELECT article FROM cart_items)
         ''')
@@ -213,16 +221,17 @@ def upsert_market_items(records):
 
     records: [{'vk_id': int, 'article': str | None, 'name': str, 'price': int,
                'sizes': [str, ...]}, ...]
-    Артикул — только SKU из карточки VK. id товара VK как артикул НЕ используется.
+    Артикул — только SKU из карточки VK. Если VK его не отдал, товар всё равно добавляется,
+    но под внутренним ключом «vk<id>», который не показывается покупателям (см. is_real_article).
+    Когда настоящий артикул появится, ключ заменится на него.
 
     Для каждого товара ищем строку в таблице: по vk_id -> по артикулу -> по названию
     (так старые товары, загруженные из Excel, не дублируются, а «привязываются» к VK).
     Найденному обновляем название, цену и размеры. Размер нужен (has_size = 1) только если
-    в карточке VK указаны размеры. Если у товара нет артикула и его нет в таблице —
-    он пропускается.
-    Возвращает (добавлено, изменено, пропущено).
+    в карточке VK указаны размеры.
+    Возвращает (добавлено, изменено, сколько товаров пришло без артикула).
     """
-    added = changed = skipped = 0
+    added = changed = no_article = 0
     with connect() as conn:
         cur = conn.cursor()
         rows = cur.execute(
@@ -243,6 +252,8 @@ def upsert_market_items(records):
             sizes = rec.get('sizes') or []
             sizes_json = json.dumps(sizes, ensure_ascii=False) if sizes else None
             has_size = 1 if sizes else 0
+            if not article:
+                no_article += 1
 
             pid = by_vk.get(vk_id)
             if pid is None and article:
@@ -256,8 +267,9 @@ def upsert_market_items(records):
 
             if pid is not None:
                 old_article = art_of[pid]
-                # Исправляем артикул, который раньше подставили как id товара VK
-                if (article and article != old_article and old_article == str(vk_id)
+                # Заменяем внутренний ключ (или «голый» id) на настоящий артикул
+                if (article and article != old_article
+                        and old_article in (str(vk_id), f'vk{vk_id}')
                         and article not in by_article):
                     cur.execute('UPDATE products SET article = ? WHERE id = ?', (article, pid))
                     cur.execute('UPDATE order_items SET article = ? WHERE article = ?',
@@ -276,8 +288,10 @@ def upsert_market_items(records):
                 data[pid] = (name, price, sizes_json, has_size)
             else:
                 if not article or article in by_article:
-                    skipped += 1    # нет артикула (или SKU занят другим товаром VK)
-                    continue
+                    # нет артикула (или SKU занят другим товаром VK) — внутренний ключ
+                    article = f'vk{vk_id}'
+                    if article in by_article:
+                        continue
                 cur.execute(
                     'INSERT INTO products (article, name, price, has_size, vk_id, sizes) '
                     'VALUES (?, ?, ?, ?, ?, ?)',
@@ -290,7 +304,7 @@ def upsert_market_items(records):
                 added += 1
             by_vk[vk_id] = pid
             vk_of[pid] = vk_id
-    return added, changed, skipped
+    return added, changed, no_article
 
 
 def get_all_products():
